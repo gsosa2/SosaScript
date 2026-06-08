@@ -12,6 +12,7 @@ Environment variables:
 """
 
 import argparse
+import importlib.util
 import os
 import random
 import time
@@ -54,8 +55,32 @@ SEL_CONFIRM_SUBMIT = (
     '.d2l-dialog-footer button:first-child'
 )
 SEL_LOGIN_USER = 'input[name="username"], input[type="email"], #userName'
-SEL_LOGIN_PASS = 'input[name="password"], input[type="password"], #password'
-SEL_LOGIN_BTN  = 'button[type="submit"], input[type="submit"], #loginButton'
+
+
+# ---------------------------------------------------------------------------
+# Find Playwright's bundled Firefox binary
+# ---------------------------------------------------------------------------
+
+def find_bundled_firefox() -> str | None:
+    spec = importlib.util.find_spec("playwright")
+    if not spec:
+        return None
+    # Playwright stores browsers under ~/.cache/ms-playwright on macOS/Linux
+    cache_dir = Path.home() / "Library" / "Caches" / "ms-playwright"
+    if not cache_dir.exists():
+        cache_dir = Path.home() / ".cache" / "ms-playwright"
+    if not cache_dir.exists():
+        return None
+    # Look for firefox-*/firefox/firefox  or  firefox-*/firefox/Nightly.app/.../firefox
+    for binary in sorted(cache_dir.glob("firefox-*/firefox/firefox"), reverse=True):
+        if binary.exists():
+            return str(binary)
+    for binary in sorted(
+        cache_dir.glob("firefox-*/firefox/Nightly.app/Contents/MacOS/firefox"), reverse=True
+    ):
+        if binary.exists():
+            return str(binary)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +106,15 @@ def ask_claude(client: anthropic.Anthropic, question_text: str, choices: list[st
 # ---------------------------------------------------------------------------
 # Page helpers
 # ---------------------------------------------------------------------------
+
+def wait_for_page(page) -> None:
+    """Wait for page to settle — avoids networkidle hanging on D2L."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    except PWTimeoutError:
+        pass
+    time.sleep(1)
+
 
 def scrape_question(page) -> tuple[str, list[str]]:
     page.wait_for_selector(SEL_QUESTION_STEM, timeout=15_000)
@@ -116,7 +150,7 @@ def advance(page) -> bool:
     for btn in page.query_selector_all(SEL_NEXT_BTN):
         if btn.is_visible() and btn.is_enabled():
             btn.click()
-            page.wait_for_load_state("networkidle", timeout=15_000)
+            wait_for_page(page)
             return True
 
     for btn in page.query_selector_all(SEL_SUBMIT_BTN):
@@ -127,7 +161,7 @@ def advance(page) -> bool:
                 page.click(SEL_CONFIRM_SUBMIT)
             except PWTimeoutError:
                 pass
-            page.wait_for_load_state("networkidle", timeout=15_000)
+            wait_for_page(page)
             print("[+] Quiz submitted.")
             return False
 
@@ -145,62 +179,43 @@ def run_quiz(url: str) -> None:
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # Resolve Playwright's own bundled Firefox so macOS doesn't open Zen/system Firefox
-    import subprocess, sys
-    try:
-        pw_firefox = subprocess.check_output(
-            [sys.executable, "-m", "playwright", "run-driver"],
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pw_firefox = None
-
-    # Find the bundled firefox binary from the playwright package location
-    import importlib.util
-    spec = importlib.util.find_spec("playwright")
-    pw_path = Path(spec.origin).parent if spec else None
-    bundled_firefox = None
-    if pw_path:
-        for candidate in pw_path.rglob("firefox/firefox"):
-            bundled_firefox = str(candidate)
-            break
-        if not bundled_firefox:
-            # macOS binary name
-            for candidate in pw_path.rglob("firefox/Nightly.app/Contents/MacOS/firefox"):
-                bundled_firefox = str(candidate)
-                break
+    bundled_firefox = find_bundled_firefox()
 
     with sync_playwright() as pw:
         launch_kwargs: dict = {"headless": False}
-        if bundled_firefox and Path(bundled_firefox).exists():
+        if bundled_firefox:
             print(f"[+] Using bundled Firefox: {bundled_firefox}")
             launch_kwargs["executable_path"] = bundled_firefox
         else:
-            print("[*] Could not locate bundled Firefox – using default.")
+            print("[*] Bundled Firefox not found – using system default.")
+
         browser = pw.firefox.launch(**launch_kwargs)
         page = browser.new_page()
 
-        print(f"[+] Opening {url}")
+        print(f"[+] Opening quiz URL...")
         page.goto(url, timeout=30_000)
-        page.wait_for_load_state("networkidle", timeout=20_000)
+        wait_for_page(page)
+        print(f"[+] Page loaded: {page.url}")
 
-        # If a login form appears, pause and let the user log in manually
+        # If login form appears, let user log in manually
         try:
             page.wait_for_selector(SEL_LOGIN_USER, timeout=6_000)
-            print("\n[!] Login page detected.")
-            print("    Please log in manually in the browser window, then press Enter here to continue...")
+            print("\n[!] Login required.")
+            print("    Log in using the browser window, then press Enter here...")
             input()
-            page.wait_for_load_state("networkidle", timeout=20_000)
-            # Re-navigate to quiz if login redirected elsewhere
+            wait_for_page(page)
             if url not in page.url:
+                print("[+] Navigating back to quiz...")
                 page.goto(url, timeout=30_000)
-                page.wait_for_load_state("networkidle", timeout=20_000)
+                wait_for_page(page)
         except PWTimeoutError:
-            pass  # No login form – already on the quiz
+            print("[+] No login needed – already on quiz page.")
 
+        print("[+] Starting quiz...\n")
         question_num = 0
         while True:
             question_num += 1
+            print(f"[Q{question_num}] Reading question...")
             try:
                 question_text, choices = scrape_question(page)
             except PWTimeoutError:
@@ -208,17 +223,18 @@ def run_quiz(url: str) -> None:
                 break
 
             if not choices:
-                print(f"  [!] Q{question_num}: No answer choices detected – skipping.")
+                print(f"  [!] No answer choices found – skipping.")
             else:
                 delay = random.randint(45, 90)
-                print(f"\n[Q{question_num}] {question_text[:120]}...")
-                print(f"  Choices : {choices}")
-                print(f"  Waiting : {delay}s before answering...")
+                print(f"  Question : {question_text[:120]}...")
+                print(f"  Choices  : {choices}")
+                print(f"  Waiting  : {delay}s before answering...")
                 time.sleep(delay)
 
                 answer_letter = ask_claude(client, question_text, choices)
-                print(f"  Answer  : {answer_letter}")
+                print(f"  Answer   : {answer_letter}")
                 select_answer(page, answer_letter, choices)
+                time.sleep(1)
 
             if not advance(page):
                 break
