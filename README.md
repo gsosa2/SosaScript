@@ -6,8 +6,14 @@ Automates D2L (Brightspace) quizzes using Playwright for browser control and Cla
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium
+playwright install firefox
 ```
+
+> **Zen Browser users:** Zen is Firefox-based, so set `ZEN_PATH` to point at your Zen binary and the bot will launch Zen instead of Playwright's bundled Firefox:
+> ```bash
+> export ZEN_PATH="/usr/lib/zen-browser/zen"   # Linux example
+> export ZEN_PATH="/Applications/Zen Browser.app/Contents/MacOS/zen"  # macOS example
+> ```
 
 Set your keys:
 

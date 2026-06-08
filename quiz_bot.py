@@ -1,6 +1,6 @@
 """
-D2L Quiz Bot
-- Reads each quiz question using Playwright
+D2L Quiz Bot (Zen Browser / Firefox)
+- Reads each quiz question using Playwright with Firefox
 - Sends the question to Claude to get the best answer
 - Waits a random 45–90 seconds before selecting and submitting the answer
 - Advances to the next question automatically
@@ -10,6 +10,9 @@ Usage:
 
 Environment variables (alternative to CLI flags):
     D2L_USERNAME, D2L_PASSWORD, ANTHROPIC_API_KEY
+
+Optional – point to your local Zen Browser binary instead of bundled Firefox:
+    ZEN_PATH=/usr/bin/zen-browser  (or wherever Zen is installed)
 """
 
 import argparse
@@ -158,8 +161,15 @@ def run_quiz(url: str, username: str, password: str, headless: bool) -> None:
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Zen Browser is Firefox-based; pass --zen-path to use your local Zen install,
+    # otherwise Playwright falls back to its own bundled Firefox.
+    zen_path = os.environ.get("ZEN_PATH")  # e.g. /usr/bin/zen-browser
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        launch_kwargs: dict = {"headless": headless}
+        if zen_path:
+            launch_kwargs["executable_path"] = zen_path
+        browser = pw.firefox.launch(**launch_kwargs)
         context = browser.new_context()
         page = context.new_page()
 
