@@ -1,26 +1,34 @@
 """
-D2L Quiz Bot (Firefox)
+D2L Quiz Bot
 
-Opens a Firefox browser window, navigates to the quiz URL, and answers
-each question using Claude AI with a random 45-90 second delay per question.
+Connects to your already-open Chrome window (no new window opened, no login needed).
+Answers each question using Claude AI with a random 45-90 second delay.
 
-Usage:
-    python quiz_bot.py --url <D2L quiz URL>
+--- SETUP (one-time) ---
+Quit Chrome completely, then launch it with remote debugging enabled:
+
+  Mac:
+    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+  Then open D2L, log in, and navigate to your quiz tab as normal.
+
+--- RUN ---
+  python quiz_bot.py --url <D2L quiz URL>
 
 Environment variables:
     ANTHROPIC_API_KEY  – your Anthropic API key (required)
 """
 
 import argparse
-import importlib.util
 import os
 import random
 import time
-from pathlib import Path
 
 import anthropic
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
+
+CDP_URL = "http://localhost:9222"
 
 # ---------------------------------------------------------------------------
 # Selectors (D2L / Brightspace)
@@ -54,33 +62,6 @@ SEL_CONFIRM_SUBMIT = (
     'button:has-text("Yes"), '
     '.d2l-dialog-footer button:first-child'
 )
-SEL_LOGIN_USER = 'input[name="username"], input[type="email"], #userName'
-
-
-# ---------------------------------------------------------------------------
-# Find Playwright's bundled Firefox binary
-# ---------------------------------------------------------------------------
-
-def find_bundled_firefox() -> str | None:
-    spec = importlib.util.find_spec("playwright")
-    if not spec:
-        return None
-    # Playwright stores browsers under ~/.cache/ms-playwright on macOS/Linux
-    cache_dir = Path.home() / "Library" / "Caches" / "ms-playwright"
-    if not cache_dir.exists():
-        cache_dir = Path.home() / ".cache" / "ms-playwright"
-    if not cache_dir.exists():
-        return None
-    # Look for firefox-*/firefox/firefox  or  firefox-*/firefox/Nightly.app/.../firefox
-    for binary in sorted(cache_dir.glob("firefox-*/firefox/firefox"), reverse=True):
-        if binary.exists():
-            return str(binary)
-    for binary in sorted(
-        cache_dir.glob("firefox-*/firefox/Nightly.app/Contents/MacOS/firefox"), reverse=True
-    ):
-        if binary.exists():
-            return str(binary)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -108,12 +89,26 @@ def ask_claude(client: anthropic.Anthropic, question_text: str, choices: list[st
 # ---------------------------------------------------------------------------
 
 def wait_for_page(page) -> None:
-    """Wait for page to settle — avoids networkidle hanging on D2L."""
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15_000)
     except PWTimeoutError:
         pass
     time.sleep(1)
+
+
+def find_quiz_page(context, url: str):
+    """Find the tab that matches the quiz URL."""
+    for page in context.pages:
+        if "quizzing" in page.url or url in page.url:
+            print(f"[+] Found quiz tab: {page.url}")
+            page.bring_to_front()
+            return page
+    # Not found – open in a new tab
+    print("[*] Quiz tab not found – opening it now...")
+    page = context.new_page()
+    page.goto(url, timeout=30_000)
+    wait_for_page(page)
+    return page
 
 
 def scrape_question(page) -> tuple[str, list[str]]:
@@ -179,37 +174,19 @@ def run_quiz(url: str) -> None:
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    bundled_firefox = find_bundled_firefox()
-
     with sync_playwright() as pw:
-        launch_kwargs: dict = {"headless": False}
-        if bundled_firefox:
-            print(f"[+] Using bundled Firefox: {bundled_firefox}")
-            launch_kwargs["executable_path"] = bundled_firefox
-        else:
-            print("[*] Bundled Firefox not found – using system default.")
-
-        browser = pw.firefox.launch(**launch_kwargs)
-        page = browser.new_page()
-
-        print(f"[+] Opening quiz URL...")
-        page.goto(url, timeout=30_000)
-        wait_for_page(page)
-        print(f"[+] Page loaded: {page.url}")
-
-        # If login form appears, let user log in manually
         try:
-            page.wait_for_selector(SEL_LOGIN_USER, timeout=6_000)
-            print("\n[!] Login required.")
-            print("    Log in using the browser window, then press Enter here...")
-            input()
-            wait_for_page(page)
-            if url not in page.url:
-                print("[+] Navigating back to quiz...")
-                page.goto(url, timeout=30_000)
-                wait_for_page(page)
-        except PWTimeoutError:
-            print("[+] No login needed – already on quiz page.")
+            browser = pw.chromium.connect_over_cdp(CDP_URL)
+        except Exception:
+            raise SystemExit(
+                "\n[!] Could not connect to Chrome.\n"
+                "    Make sure Chrome is running with remote debugging:\n\n"
+                '    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n'
+            )
+
+        print("[+] Connected to your Chrome session.")
+        context = browser.contexts[0]
+        page = find_quiz_page(context, url)
 
         print("[+] Starting quiz...\n")
         question_num = 0
@@ -239,7 +216,6 @@ def run_quiz(url: str) -> None:
             if not advance(page):
                 break
 
-        browser.close()
         print("[+] Done.")
 
 
@@ -248,7 +224,7 @@ def run_quiz(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="D2L quiz bot powered by Claude.")
+    parser = argparse.ArgumentParser(description="D2L quiz bot – attaches to your open Chrome tab.")
     parser.add_argument("--url", required=True, help="Full URL of the D2L quiz page.")
     args = parser.parse_args()
     run_quiz(args.url)
