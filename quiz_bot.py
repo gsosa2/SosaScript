@@ -15,6 +15,7 @@ import argparse
 import os
 import random
 import time
+from pathlib import Path
 
 import anthropic
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -144,8 +145,39 @@ def run_quiz(url: str) -> None:
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Resolve Playwright's own bundled Firefox so macOS doesn't open Zen/system Firefox
+    import subprocess, sys
+    try:
+        pw_firefox = subprocess.check_output(
+            [sys.executable, "-m", "playwright", "run-driver"],
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pw_firefox = None
+
+    # Find the bundled firefox binary from the playwright package location
+    import importlib.util
+    spec = importlib.util.find_spec("playwright")
+    pw_path = Path(spec.origin).parent if spec else None
+    bundled_firefox = None
+    if pw_path:
+        for candidate in pw_path.rglob("firefox/firefox"):
+            bundled_firefox = str(candidate)
+            break
+        if not bundled_firefox:
+            # macOS binary name
+            for candidate in pw_path.rglob("firefox/Nightly.app/Contents/MacOS/firefox"):
+                bundled_firefox = str(candidate)
+                break
+
     with sync_playwright() as pw:
-        browser = pw.firefox.launch(headless=False)
+        launch_kwargs: dict = {"headless": False}
+        if bundled_firefox and Path(bundled_firefox).exists():
+            print(f"[+] Using bundled Firefox: {bundled_firefox}")
+            launch_kwargs["executable_path"] = bundled_firefox
+        else:
+            print("[*] Could not locate bundled Firefox – using default.")
+        browser = pw.firefox.launch(**launch_kwargs)
         page = browser.new_page()
 
         print(f"[+] Opening {url}")
