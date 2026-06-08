@@ -1,50 +1,65 @@
 # SosaScript – D2L Quiz Bot
 
-Automates D2L (Brightspace) quizzes using Playwright for browser control and Claude for answering questions.
+Automates D2L (Brightspace) quizzes using your **existing Zen Browser session** — no login needed. Uses Claude AI to read and answer each question, with a random 45–90 second pause before each answer.
 
-## Setup
+---
 
+## Mac Setup (one-time)
+
+You do **not** need IntelliJ. Just a Terminal and Python.
+
+### 1. Check Python is installed
 ```bash
-pip install -r requirements.txt
+python3 --version
+```
+If it prints a version (3.9+), you're good. If not, download it from [python.org](https://www.python.org/downloads/).
+
+### 2. Download this project
+```bash
+cd ~/Desktop
+git clone https://github.com/gsosa2/sosascript.git
+cd sosascript
+```
+
+### 3. Install dependencies
+```bash
+pip3 install -r requirements.txt
 playwright install firefox
 ```
 
-> **Zen Browser users:** Zen is Firefox-based, so set `ZEN_PATH` to point at your Zen binary and the bot will launch Zen instead of Playwright's bundled Firefox:
-> ```bash
-> export ZEN_PATH="/usr/lib/zen-browser/zen"   # Linux example
-> export ZEN_PATH="/Applications/Zen Browser.app/Contents/MacOS/zen"  # macOS example
-> ```
-
-Set your keys:
-
+### 4. Set your Anthropic API key
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-export D2L_USERNAME="you@school.edu"
-export D2L_PASSWORD="yourpassword"
 ```
+Get a key at [console.anthropic.com](https://console.anthropic.com).
 
-## Run
+> **Tip:** Add the export line to `~/.zshrc` so you don't have to re-enter it each time.
+
+---
+
+## Running the bot
+
+1. **Open Zen Browser** and navigate to your D2L quiz tab (log in manually as usual)
+2. **Close all other Zen windows** — the script attaches to your profile, so fewer open windows = less confusion
+3. In Terminal:
 
 ```bash
-python quiz_bot.py --url "https://your.school.d2l.com/d2l/lms/quizzing/..."
+cd ~/Desktop/sosascript
+python3 quiz_bot.py --url "https://yourschool.brightspace.com/d2l/lms/quizzing/..."
 ```
 
-### Options
+The script will:
+- Launch a new Zen window attached to your existing session (you'll already be logged in)
+- Find the quiz tab or open the URL
+- For each question: wait 45–90 seconds → ask Claude → select the answer → click Next
+- Submit automatically on the last question
 
-| Flag | Description |
-|------|-------------|
-| `--url` | Full URL to the D2L quiz page (required) |
-| `--username` | D2L login email (or set `D2L_USERNAME`) |
-| `--password` | D2L password (or set `D2L_PASSWORD`) |
-| `--headed` | Show the browser window (useful for debugging) |
+---
 
-## How it works
+## Troubleshooting
 
-1. Opens the quiz URL in a Chromium browser
-2. Logs in automatically if a login form is present
-3. For each question:
-   - Reads the question stem and all answer choices
-   - Waits a **random 45–90 seconds** before answering
-   - Sends the question to Claude, which picks the best answer
-   - Selects that answer and clicks **Next**
-4. Submits the quiz when the last question is reached
+| Problem | Fix |
+|---------|-----|
+| `Zen Browser not found` | Set `export ZEN_PATH="/Applications/Zen Browser.app/Contents/MacOS/zen"` |
+| `No Zen profile found` | Set `export ZEN_PROFILE="$HOME/Library/Application Support/zen/Profiles/your-profile-dir"` |
+| Answers not being selected | Run with `--url` and watch — D2L selector may differ; open an issue with a screenshot |
