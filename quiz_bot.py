@@ -3,23 +3,24 @@ D2L Quiz Bot
 
 Connects to your already-open Chrome window (no new window opened, no login needed).
 Answers each question using Claude AI with a random 45-90 second delay.
+Handles both text-only and image-based questions by screenshotting the question area.
 
 --- SETUP (one-time) ---
-Quit Chrome completely, then launch it with remote debugging enabled:
+Launch Chrome with remote debugging:
 
-  Mac:
-    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222
+  /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug &
 
-  Then open D2L, log in, and navigate to your quiz tab as normal.
+  Then open D2L, log in, and navigate to your quiz tab.
 
 --- RUN ---
-  python quiz_bot.py --url <D2L quiz URL>
+  python3 quiz_bot.py --url <D2L quiz URL>
 
 Environment variables:
     ANTHROPIC_API_KEY  – your Anthropic API key (required)
 """
 
 import argparse
+import base64
 import os
 import random
 import time
@@ -63,23 +64,54 @@ SEL_CONFIRM_SUBMIT = (
     '.d2l-dialog-footer button:first-child'
 )
 
+# Broad selector for the whole question block (used for screenshot)
+SEL_QUESTION_BLOCK = (
+    '.d2l-le-quizpresenter-question-container, '
+    '.qnTitle, '
+    '[class*="question"], '
+    'fieldset, '
+    'form'
+)
+
 
 # ---------------------------------------------------------------------------
-# Claude helper
+# Claude helper – handles text-only and image questions
 # ---------------------------------------------------------------------------
 
-def ask_claude(client: anthropic.Anthropic, question_text: str, choices: list[str]) -> str:
+def ask_claude(
+    client: anthropic.Anthropic,
+    question_text: str,
+    choices: list[str],
+    screenshot_b64: str | None = None,
+) -> str:
     lettered = "\n".join(f"{chr(65 + i)}) {c}" for i, c in enumerate(choices))
-    prompt = (
+    text_prompt = (
         "Answer the following multiple-choice question. "
         "Reply with ONLY the letter of the best answer (A, B, C, …).\n\n"
         f"Question:\n{question_text}\n\n"
         f"Choices:\n{lettered}"
     )
+
+    if screenshot_b64:
+        # Send both the screenshot and the text so Claude can see any images
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": screenshot_b64,
+                },
+            },
+            {"type": "text", "text": text_prompt},
+        ]
+    else:
+        content = text_prompt
+
     message = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=16,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": content}],
     )
     return message.content[0].text.strip().upper()
 
@@ -97,13 +129,11 @@ def wait_for_page(page) -> None:
 
 
 def find_quiz_page(context, url: str):
-    """Find the tab that matches the quiz URL."""
     for page in context.pages:
         if "quizzing" in page.url or url in page.url:
             print(f"[+] Found quiz tab: {page.url}")
             page.bring_to_front()
             return page
-    # Not found – open in a new tab
     print("[*] Quiz tab not found – opening it now...")
     page = context.new_page()
     page.goto(url, timeout=30_000)
@@ -123,6 +153,32 @@ def scrape_question(page) -> tuple[str, list[str]]:
     choices = [lbl.inner_text().strip() for lbl in labels if lbl.inner_text().strip()]
 
     return question_text, choices
+
+
+def screenshot_question(page) -> str | None:
+    """Screenshot the question block and return base64 PNG, or None on failure."""
+    try:
+        el = page.query_selector(SEL_QUESTION_BLOCK)
+        if el:
+            png_bytes = el.screenshot()
+        else:
+            png_bytes = page.screenshot()
+        return base64.b64encode(png_bytes).decode()
+    except Exception as e:
+        print(f"  [!] Screenshot failed: {e}")
+        return None
+
+
+def question_has_image(page) -> bool:
+    """Return True if the question area contains an <img> tag."""
+    try:
+        stems = page.query_selector_all(SEL_QUESTION_STEM)
+        for el in stems:
+            if el.query_selector("img"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def select_answer(page, letter: str, choices: list[str]) -> None:
@@ -164,16 +220,19 @@ def advance(page) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Debug helper
 # ---------------------------------------------------------------------------
 
 def dump_page(page) -> None:
-    """Save page HTML to a file for selector debugging."""
     path = os.path.expanduser("~/Downloads/quiz_debug.html")
     with open(path, "w") as f:
         f.write(page.content())
     print(f"[debug] Page HTML saved to {path}")
 
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def run_quiz(url: str, debug: bool = False) -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -188,8 +247,9 @@ def run_quiz(url: str, debug: bool = False) -> None:
         except Exception:
             raise SystemExit(
                 "\n[!] Could not connect to Chrome.\n"
-                "    Make sure Chrome is running with remote debugging:\n\n"
-                "    open -a 'Google Chrome' --args --remote-debugging-port=9222\n"
+                "    Launch Chrome with:\n\n"
+                '    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+                "--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug &\n"
             )
 
         print("[+] Connected to your Chrome session.")
@@ -219,10 +279,17 @@ def run_quiz(url: str, debug: bool = False) -> None:
                 delay = random.randint(45, 90)
                 print(f"  Question : {question_text[:120]}...")
                 print(f"  Choices  : {choices}")
+
+                # Always screenshot — captures images if present, harmless if not
+                screenshot_b64 = screenshot_question(page)
+                has_img = question_has_image(page)
+                if has_img:
+                    print(f"  [+] Image detected — sending screenshot to Claude.")
+
                 print(f"  Waiting  : {delay}s before answering...")
                 time.sleep(delay)
 
-                answer_letter = ask_claude(client, question_text, choices)
+                answer_letter = ask_claude(client, question_text, choices, screenshot_b64)
                 print(f"  Answer   : {answer_letter}")
                 select_answer(page, answer_letter, choices)
                 time.sleep(1)
