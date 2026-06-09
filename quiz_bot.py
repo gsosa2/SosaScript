@@ -45,13 +45,12 @@ SEL_ANSWER_ROWS    = 'tr.d2l-rowshadeonhover'
 SEL_ANSWER_TEXT_TD = 'td.d_tb, td.d_tw'
 
 SEL_NEXT_BTN       = (
+    'button:has-text("Next Page"), '
     'button:has-text("Next"), '
-    'button:has-text("Save & Next"), '
-    'input[type="button"][value="Next"]'
+    'button:has-text("Save & Next")'
 )
 SEL_SUBMIT_BTN     = (
     'button:has-text("Submit Quiz"), '
-    'input[type="button"][value="Submit Quiz"], '
     'a:has-text("Submit Quiz")'
 )
 SEL_CONFIRM_SUBMIT = (
@@ -154,28 +153,42 @@ def get_quiz_frame(page):
     return page
 
 
+def html_attr_to_text(html: str) -> str:
+    """Strip HTML tags from a d2l-html-block html attribute value."""
+    import re
+    return re.sub(r'<[^>]+>', '', html).replace('&amp;', '&').replace('&#160;', ' ').replace('&lt;', '<').replace('&gt;', '>').strip()
+
+
 def scrape_question(frame) -> tuple[str, list[str]]:
     frame.wait_for_selector(SEL_QUESTION_BLOCK, timeout=15_000)
 
-    # Question text is inside shadow DOM of d2l-html-block — pierce it via JS
+    # Question text is in the html attribute of the first d2l-html-block
     question_text = frame.evaluate("""() => {
         const blocks = document.querySelectorAll('d2l-html-block');
-        return Array.from(blocks)
-            .map(b => b.shadowRoot ? b.shadowRoot.querySelector('.d2l-html-block-rendered') : null)
-            .filter(Boolean)
-            .map(el => el.innerText.trim())
-            .join(' ');
+        // First block is the question stem (not inside an answer row)
+        for (const b of blocks) {
+            if (!b.closest('tr.d2l-rowshadeonhover')) {
+                const html = b.getAttribute('html') || '';
+                const div = document.createElement('div');
+                div.innerHTML = html;
+                return div.innerText.trim();
+            }
+        }
+        return '';
     }""")
 
-    # Answer text is in the second td of each answer row
-    rows = frame.query_selector_all(SEL_ANSWER_ROWS)
-    choices = []
-    for row in rows:
-        td = row.query_selector(SEL_ANSWER_TEXT_TD)
-        if td:
-            text = td.inner_text().strip()
-            if text:
-                choices.append(text)
+    # Answer text: each answer row has a d2l-html-block in the second td
+    choices = frame.evaluate("""() => {
+        const rows = document.querySelectorAll('tr.d2l-rowshadeonhover');
+        return Array.from(rows).map(row => {
+            const block = row.querySelector('td.d_tb d2l-html-block, td.d_tw d2l-html-block');
+            if (!block) return '';
+            const html = block.getAttribute('html') || '';
+            const div = document.createElement('div');
+            div.innerHTML = html;
+            return div.innerText.trim();
+        }).filter(Boolean);
+    }""")
 
     return question_text, choices
 
@@ -192,14 +205,16 @@ def screenshot_question(frame) -> str | None:
 
 
 def question_has_image(frame) -> bool:
-    """Return True if the question area contains an <img> tag."""
+    """Return True if the question stem's html attribute contains an <img> tag."""
     try:
         return frame.evaluate("""() => {
             const blocks = document.querySelectorAll('d2l-html-block');
-            return Array.from(blocks).some(b => {
-                const root = b.shadowRoot;
-                return root && root.querySelector('img') !== null;
-            });
+            for (const b of blocks) {
+                if (!b.closest('tr.d2l-rowshadeonhover')) {
+                    return (b.getAttribute('html') || '').includes('<img');
+                }
+            }
+            return false;
         }""")
     except Exception:
         return False
