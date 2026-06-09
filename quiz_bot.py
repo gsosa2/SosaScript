@@ -32,45 +32,31 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 CDP_URL = "http://localhost:9222"
 
 # ---------------------------------------------------------------------------
-# Selectors (D2L / Brightspace)
+# Selectors (GGC D2L / Brightspace)
 # ---------------------------------------------------------------------------
-SEL_QUESTION_STEM = (
-    '.d2l-htmleditor-container, '
-    '.qnTitle, '
-    '[class*="question-text"], '
-    '.ds-question-stem, '
-    'd2l-html-block'
-)
-SEL_ANSWERS        = (
-    'input[type="radio"] + label, '
-    'input[type="radio"] ~ span, '
-    'label.d2l-label-text, '
-    '.ds-answer-option label'
-)
-SEL_RADIO_INPUTS   = 'input[type="radio"]'
-SEL_CHECKBOX_INPUT = 'input[type="checkbox"]'
+
+# Question text lives inside a shadow DOM inside <d2l-html-block>
+SEL_QUESTION_BLOCK = 'd2l-html-block'
+
+# Answer rows – each row has onclick="SetRadioButtonAsSelected(...)"
+SEL_ANSWER_ROWS    = 'tr.d2l-rowshadeonhover'
+
+# The text of each answer is in the second td (class d_tb or d_tw)
+SEL_ANSWER_TEXT_TD = 'td.d_tb, td.d_tw'
+
 SEL_NEXT_BTN       = (
     'button:has-text("Next"), '
     'button:has-text("Save & Next"), '
-    '[data-keybinding="next-question"]'
+    'input[type="button"][value="Next"]'
 )
 SEL_SUBMIT_BTN     = (
     'button:has-text("Submit Quiz"), '
-    'button:has-text("Submit"), '
+    'input[type="button"][value="Submit Quiz"], '
     'a:has-text("Submit Quiz")'
 )
 SEL_CONFIRM_SUBMIT = (
     'button:has-text("Yes"), '
     '.d2l-dialog-footer button:first-child'
-)
-
-# Broad selector for the whole question block (used for screenshot)
-SEL_QUESTION_BLOCK = (
-    '.d2l-le-quizpresenter-question-container, '
-    '.qnTitle, '
-    '[class*="question"], '
-    'fieldset, '
-    'form'
 )
 
 
@@ -164,60 +150,66 @@ def get_quiz_frame(page):
     return page
 
 
-def scrape_question(page) -> tuple[str, list[str]]:
-    page.wait_for_selector(SEL_QUESTION_STEM, timeout=15_000)
+def scrape_question(frame) -> tuple[str, list[str]]:
+    frame.wait_for_selector(SEL_QUESTION_BLOCK, timeout=15_000)
 
-    stems = page.query_selector_all(SEL_QUESTION_STEM)
-    question_text = " ".join(
-        el.inner_text().strip() for el in stems if el.inner_text().strip()
-    )
+    # Question text is inside shadow DOM of d2l-html-block — pierce it via JS
+    question_text = frame.evaluate("""() => {
+        const blocks = document.querySelectorAll('d2l-html-block');
+        return Array.from(blocks)
+            .map(b => b.shadowRoot ? b.shadowRoot.querySelector('.d2l-html-block-rendered') : null)
+            .filter(Boolean)
+            .map(el => el.innerText.trim())
+            .join(' ');
+    }""")
 
-    labels = page.query_selector_all(SEL_ANSWERS)
-    choices = [lbl.inner_text().strip() for lbl in labels if lbl.inner_text().strip()]
+    # Answer text is in the second td of each answer row
+    rows = frame.query_selector_all(SEL_ANSWER_ROWS)
+    choices = []
+    for row in rows:
+        td = row.query_selector(SEL_ANSWER_TEXT_TD)
+        if td:
+            text = td.inner_text().strip()
+            if text:
+                choices.append(text)
 
     return question_text, choices
 
 
-def screenshot_question(page) -> str | None:
+def screenshot_question(frame) -> str | None:
     """Screenshot the question block and return base64 PNG, or None on failure."""
     try:
-        el = page.query_selector(SEL_QUESTION_BLOCK)
-        if el:
-            png_bytes = el.screenshot()
-        else:
-            png_bytes = page.screenshot()
+        el = frame.query_selector(SEL_QUESTION_BLOCK)
+        png_bytes = el.screenshot() if el else frame.screenshot()
         return base64.b64encode(png_bytes).decode()
     except Exception as e:
         print(f"  [!] Screenshot failed: {e}")
         return None
 
 
-def question_has_image(page) -> bool:
+def question_has_image(frame) -> bool:
     """Return True if the question area contains an <img> tag."""
     try:
-        stems = page.query_selector_all(SEL_QUESTION_STEM)
-        for el in stems:
-            if el.query_selector("img"):
-                return True
+        return frame.evaluate("""() => {
+            const blocks = document.querySelectorAll('d2l-html-block');
+            return Array.from(blocks).some(b => {
+                const root = b.shadowRoot;
+                return root && root.querySelector('img') !== null;
+            });
+        }""")
     except Exception:
-        pass
-    return False
+        return False
 
 
-def select_answer(page, letter: str, choices: list[str]) -> None:
+def select_answer(frame, letter: str, choices: list[str]) -> None:
     index = ord(letter) - ord("A")
     if index < 0 or index >= len(choices):
         print(f"  [!] Letter '{letter}' out of range – defaulting to A.")
         index = 0
 
-    radios = page.query_selector_all(SEL_RADIO_INPUTS)
-    if radios and index < len(radios):
-        radios[index].click()
-        return
-
-    checkboxes = page.query_selector_all(SEL_CHECKBOX_INPUT)
-    if checkboxes and index < len(checkboxes):
-        checkboxes[index].click()
+    rows = frame.query_selector_all(SEL_ANSWER_ROWS)
+    if rows and index < len(rows):
+        rows[index].click()
 
 
 def advance(page) -> bool:
