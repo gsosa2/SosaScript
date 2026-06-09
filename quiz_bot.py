@@ -1,66 +1,123 @@
 """
-D2L Quiz Bot
+D2L Quiz Bot (GGC / Brightspace)
 
-Connects to your already-open Chrome window (no new window opened, no login needed).
-Answers each question using Claude AI with a random 45-90 second delay.
-Handles both text-only and image-based questions by screenshotting the question area.
+Connects to your already-open Chrome window and answers each quiz question
+using Claude AI with a random 45-90 second delay per question.
+Handles text questions, image questions, and multi-page quizzes.
 
 --- SETUP (one-time) ---
-Launch Chrome with remote debugging:
+Quit Chrome, then relaunch with remote debugging:
 
-  /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug &
+  /Applications/Google Chrome.app/Contents/MacOS/Google Chrome \
+    --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug &
 
-  Then open D2L, log in, and navigate to your quiz tab.
+  Log into D2L and open your quiz tab normally.
 
 --- RUN ---
   python3 quiz_bot.py --url <D2L quiz URL>
 
 Environment variables:
-    ANTHROPIC_API_KEY  – your Anthropic API key (required)
+    ANTHROPIC_API_KEY  – required
 """
 
 import argparse
 import base64
 import os
 import random
+import re
 import time
 
 import anthropic
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-
 CDP_URL = "http://localhost:9222"
 
-# ---------------------------------------------------------------------------
-# Selectors (GGC D2L / Brightspace)
-# ---------------------------------------------------------------------------
-
-# Question text lives inside a shadow DOM inside <d2l-html-block>
-SEL_QUESTION_BLOCK = 'd2l-html-block'
-
-# Answer rows – each row has onclick="SetRadioButtonAsSelected(...)"
-SEL_ANSWER_ROWS    = 'tr.d2l-rowshadeonhover'
-
-# The text of each answer is in the second td (class d_tb or d_tw)
-SEL_ANSWER_TEXT_TD = 'td.d_tb, td.d_tw'
-
-SEL_NEXT_BTN       = (
-    'button:has-text("Next Page"), '
-    'button:has-text("Next"), '
-    'button:has-text("Save & Next")'
-)
-SEL_SUBMIT_BTN     = (
-    'button:has-text("Submit Quiz"), '
-    'a:has-text("Submit Quiz")'
-)
-SEL_CONFIRM_SUBMIT = (
-    'button:has-text("Yes"), '
-    '.d2l-dialog-footer button:first-child'
-)
-
 
 # ---------------------------------------------------------------------------
-# Claude helper – handles text-only and image questions
+# JS helpers executed inside the quiz frame
+# ---------------------------------------------------------------------------
+
+JS_GET_QUESTION = """() => {
+    // Question stem: first d2l-html-block NOT inside an answer row
+    const blocks = document.querySelectorAll('d2l-html-block');
+    for (const b of blocks) {
+        if (!b.closest('tr.d2l-rowshadeonhover')) {
+            const html = b.getAttribute('html') || b.innerHTML || '';
+            const div = document.createElement('div');
+            div.innerHTML = html;
+            return div.innerText.trim();
+        }
+    }
+    // Fallback: heading text
+    const h = document.querySelector('h2.d2l-quiz-skip-nav-target');
+    return h ? h.innerText.trim() : '';
+}"""
+
+JS_GET_CHOICES = """() => {
+    const rows = document.querySelectorAll('tr.d2l-rowshadeonhover');
+    return Array.from(rows).map(row => {
+        // Answer text is in the wide td (d_tb or d_tw)
+        const block = row.querySelector('td.d_tb d2l-html-block, td.d_tw d2l-html-block');
+        if (block) {
+            const html = block.getAttribute('html') || block.innerHTML || '';
+            const div = document.createElement('div');
+            div.innerHTML = html;
+            return div.innerText.replace(/\\u00a0/g, ' ').trim();
+        }
+        // Fallback: plain text of td
+        const td = row.querySelector('td.d_tb, td.d_tw');
+        return td ? td.innerText.trim() : '';
+    }).filter(Boolean);
+}"""
+
+JS_HAS_IMAGE = """() => {
+    const blocks = document.querySelectorAll('d2l-html-block');
+    for (const b of blocks) {
+        if (!b.closest('tr.d2l-rowshadeonhover')) {
+            const html = b.getAttribute('html') || b.innerHTML || '';
+            if (html.toLowerCase().includes('<img')) return true;
+        }
+    }
+    return false;
+}"""
+
+JS_PAGE_INFO = """() => {
+    // Returns {current, total} from "Page X of Y" label
+    const labels = document.querySelectorAll('label');
+    for (const l of labels) {
+        const m = l.innerText.match(/Page\\s+(\\d+)\\s+of\\s+(\\d+)/i);
+        if (m) return {current: parseInt(m[1]), total: parseInt(m[2])};
+    }
+    // Fallback: hidden input pg
+    const pg = document.querySelector('input[name="pg"]');
+    const total = document.querySelector('input[name="z_d"]');
+    return {
+        current: pg ? parseInt(pg.value) : null,
+        total: total ? parseInt(total.value) : null
+    };
+}"""
+
+JS_IS_ANSWERED = """() => {
+    // True if any answer row is selected
+    return document.querySelector('tr.d2l-rowshadeonhover-selected') !== null
+        || document.querySelector('input.d2l-radio:checked') !== null;
+}"""
+
+JS_CLICK_ANSWER = """(index) => {
+    const rows = document.querySelectorAll('tr.d2l-rowshadeonhover');
+    if (rows[index]) {
+        rows[index].click();
+        return true;
+    }
+    // Fallback: click the radio directly
+    const radios = document.querySelectorAll('input.d2l-radio');
+    if (radios[index]) { radios[index].click(); return true; }
+    return false;
+}"""
+
+
+# ---------------------------------------------------------------------------
+# Claude
 # ---------------------------------------------------------------------------
 
 def ask_claude(
@@ -76,41 +133,37 @@ def ask_claude(
         f"Question:\n{question_text}\n\n"
         f"Choices:\n{lettered}"
     )
-
+    content: list | str
     if screenshot_b64:
-        # Send both the screenshot and the text so Claude can see any images
         content = [
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": screenshot_b64,
-                },
-            },
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": screenshot_b64}},
             {"type": "text", "text": text_prompt},
         ]
     else:
         content = text_prompt
 
-    message = client.messages.create(
+    msg = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=16,
         messages=[{"role": "user", "content": content}],
     )
-    return message.content[0].text.strip().upper()
+    letter = msg.content[0].text.strip().upper()
+    # In case Claude returns "A)" or "A." strip trailing punctuation
+    letter = re.sub(r'[^A-Z]', '', letter)
+    return letter[0] if letter else "A"
 
 
 # ---------------------------------------------------------------------------
-# Page helpers
+# Browser helpers
 # ---------------------------------------------------------------------------
 
-def wait_for_page(page) -> None:
+def wait_for_page(frame) -> None:
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        frame.wait_for_load_state("domcontentloaded", timeout=10_000)
     except PWTimeoutError:
         pass
-    time.sleep(1)
+    time.sleep(1.5)
 
 
 def find_quiz_page(context, url: str):
@@ -119,7 +172,7 @@ def find_quiz_page(context, url: str):
             print(f"[+] Found quiz tab: {page.url}")
             page.bring_to_front()
             return page
-    print("[*] Quiz tab not found – opening it now...")
+    print("[*] Opening quiz URL in new tab...")
     page = context.new_page()
     page.goto(url, timeout=30_000)
     wait_for_page(page)
@@ -127,169 +180,133 @@ def find_quiz_page(context, url: str):
 
 
 def get_quiz_frame(page):
-    """
-    D2L nests the quiz in one or more iframes. Walk all frames and pick
-    the deepest one that contains quiz question content.
-    """
-    print(f"[+] All frames found:")
-    for frame in page.frames:
-        print(f"    {frame.url}")
+    """Find the frame that actually contains quiz question elements."""
+    all_frames = page.frames
+    print(f"[+] Frames detected: {len(all_frames)}")
+    for f in all_frames:
+        print(f"      {f.url[:100]}")
 
-    # Prefer the innermost frame with actual question content
-    for frame in reversed(page.frames):
+    # Walk frames deepest-first, find one with quiz content
+    for frame in reversed(all_frames):
         if frame == page.main_frame:
             continue
         try:
-            has_content = frame.evaluate("""() => {
-                return document.querySelectorAll('d2l-html-block, tr.d2l-rowshadeonhover, .dfs_m').length > 0;
-            }""")
-            if has_content:
-                print(f"[+] Using quiz frame: {frame.url}")
+            count = frame.evaluate(
+                "() => document.querySelectorAll("
+                "'d2l-html-block, tr.d2l-rowshadeonhover, .dfs_m, input.d2l-radio').length"
+            )
+            if count > 0:
+                print(f"[+] Quiz frame found ({count} elements): {frame.url[:80]}")
                 return frame
         except Exception:
             continue
 
-    print("[*] No quiz frame found – using main page.")
-    return page
+    print("[*] No quiz iframe found – using main page frame.")
+    return page.main_frame
 
 
-def html_attr_to_text(html: str) -> str:
-    """Strip HTML tags from a d2l-html-block html attribute value."""
-    import re
-    return re.sub(r'<[^>]+>', '', html).replace('&amp;', '&').replace('&#160;', ' ').replace('&lt;', '<').replace('&gt;', '>').strip()
-
-
-def scrape_question(frame) -> tuple[str, list[str]]:
-    frame.wait_for_selector(SEL_QUESTION_BLOCK, timeout=15_000)
-
-    # Question text is in the html attribute of the first d2l-html-block
-    question_text = frame.evaluate("""() => {
-        const blocks = document.querySelectorAll('d2l-html-block');
-        // First block is the question stem (not inside an answer row)
-        for (const b of blocks) {
-            if (!b.closest('tr.d2l-rowshadeonhover')) {
-                const html = b.getAttribute('html') || '';
-                const div = document.createElement('div');
-                div.innerHTML = html;
-                return div.innerText.trim();
-            }
-        }
-        return '';
-    }""")
-
-    # Answer text: each answer row has a d2l-html-block in the second td
-    choices = frame.evaluate("""() => {
-        const rows = document.querySelectorAll('tr.d2l-rowshadeonhover');
-        return Array.from(rows).map(row => {
-            const block = row.querySelector('td.d_tb d2l-html-block, td.d_tw d2l-html-block');
-            if (!block) return '';
-            const html = block.getAttribute('html') || '';
-            const div = document.createElement('div');
-            div.innerHTML = html;
-            return div.innerText.trim();
-        }).filter(Boolean);
-    }""")
-
-    return question_text, choices
-
-
-def screenshot_question(frame) -> str | None:
-    """Screenshot the question block and return base64 PNG, or None on failure."""
+def screenshot_frame(frame) -> str | None:
     try:
-        el = frame.query_selector(SEL_QUESTION_BLOCK)
-        png_bytes = el.screenshot() if el else frame.screenshot()
-        return base64.b64encode(png_bytes).decode()
+        # Screenshot just the question block if possible
+        el = frame.query_selector('d2l-html-block:not(tr.d2l-rowshadeonhover d2l-html-block)')
+        if not el:
+            el = frame.query_selector('.dfs_m, fieldset')
+        png = el.screenshot() if el else frame.screenshot()
+        return base64.b64encode(png).decode()
     except Exception as e:
         print(f"  [!] Screenshot failed: {e}")
         return None
 
 
-def question_has_image(frame) -> bool:
-    """Return True if the question stem's html attribute contains an <img> tag."""
-    try:
-        return frame.evaluate("""() => {
-            const blocks = document.querySelectorAll('d2l-html-block');
-            for (const b of blocks) {
-                if (!b.closest('tr.d2l-rowshadeonhover')) {
-                    return (b.getAttribute('html') || '').includes('<img');
-                }
-            }
-            return false;
-        }""")
-    except Exception:
-        return False
+# ---------------------------------------------------------------------------
+# Quiz logic
+# ---------------------------------------------------------------------------
+
+def scrape_question(frame) -> tuple[str, list[str]]:
+    frame.wait_for_selector('d2l-html-block, tr.d2l-rowshadeonhover', timeout=15_000)
+    question_text: str = frame.evaluate(JS_GET_QUESTION)
+    choices: list[str] = frame.evaluate(JS_GET_CHOICES)
+    return question_text, choices
 
 
-def select_answer(frame, letter: str, choices: list[str]) -> None:
+def select_answer(frame, letter: str, choices: list[str]) -> bool:
     index = ord(letter) - ord("A")
     if index < 0 or index >= len(choices):
-        print(f"  [!] Letter '{letter}' out of range – defaulting to A.")
+        print(f"  [!] Letter '{letter}' out of range (have {len(choices)} choices) – using A.")
         index = 0
+    clicked = frame.evaluate(JS_CLICK_ANSWER, index)
+    time.sleep(0.8)
+    # Verify selection registered
+    answered = frame.evaluate(JS_IS_ANSWERED)
+    if not answered:
+        print("  [!] Answer may not have registered – retrying click.")
+        frame.evaluate(JS_CLICK_ANSWER, index)
+        time.sleep(0.8)
+    return answered
 
-    rows = frame.query_selector_all(SEL_ANSWER_ROWS)
-    if rows and index < len(rows):
-        rows[index].click()
+
+def get_page_info(frame) -> dict:
+    try:
+        return frame.evaluate(JS_PAGE_INFO)
+    except Exception:
+        return {"current": None, "total": None}
 
 
-def advance(page) -> bool:
-    for btn in page.query_selector_all(SEL_NEXT_BTN):
-        if btn.is_visible() and btn.is_enabled():
-            btn.click()
-            wait_for_page(page)
-            return True
+def advance(frame) -> bool:
+    """Click Next Page if available; Submit if on last page. Returns False when done."""
+    # Try Next Page button (use :first-of-type to avoid double-clicking)
+    for text in ["Next Page", "Next", "Save & Next"]:
+        btns = frame.query_selector_all(f'button:has-text("{text}")')
+        for btn in btns:
+            if btn.is_visible() and btn.is_enabled():
+                btn.click()
+                wait_for_page(frame)
+                return True
 
-    for btn in page.query_selector_all(SEL_SUBMIT_BTN):
-        if btn.is_visible() and btn.is_enabled():
-            btn.click()
-            try:
-                page.wait_for_selector(SEL_CONFIRM_SUBMIT, timeout=5_000)
-                page.click(SEL_CONFIRM_SUBMIT)
-            except PWTimeoutError:
-                pass
-            wait_for_page(page)
-            print("[+] Quiz submitted.")
-            return False
+    # Try Submit Quiz
+    for text in ["Submit Quiz"]:
+        btns = frame.query_selector_all(f'button:has-text("{text}"), a:has-text("{text}")')
+        for btn in btns:
+            if btn.is_visible() and btn.is_enabled():
+                btn.click()
+                # Confirm dialog if it appears
+                try:
+                    frame.wait_for_selector(
+                        'button:has-text("Yes"), .d2l-dialog-footer button',
+                        timeout=5_000
+                    )
+                    for confirm in frame.query_selector_all(
+                        'button:has-text("Yes"), .d2l-dialog-footer button'
+                    ):
+                        if confirm.is_visible():
+                            confirm.click()
+                            break
+                except PWTimeoutError:
+                    pass
+                wait_for_page(frame)
+                print("[+] Quiz submitted.")
+                return False
 
     return False
 
 
 # ---------------------------------------------------------------------------
-# Debug helper
+# Debug
 # ---------------------------------------------------------------------------
 
-def dump_page(page, frame=None) -> None:
+def dump_page(frame) -> None:
     path = os.path.expanduser("~/Downloads/quiz_debug.html")
-    # Try the iframe first; fall back to full page
-    saved = False
-    if frame and frame != page:
-        try:
-            html = frame.content()
-            with open(path, "w") as f:
-                f.write(html)
-            saved = True
-        except Exception:
-            pass
-    if not saved:
-        # Pull HTML from every frame via JS and concatenate
-        all_html = page.evaluate("""() => {
-            let out = '<!-- MAIN PAGE -->' + document.documentElement.outerHTML;
-            for (const iframe of document.querySelectorAll('iframe')) {
-                try {
-                    out += '\\n\\n<!-- IFRAME: ' + iframe.src + ' -->\\n';
-                    out += iframe.contentDocument.documentElement.outerHTML;
-                } catch(e) {
-                    out += '<!-- could not access iframe: ' + e + ' -->';
-                }
-            }
-            return out;
-        }""")
-        with open(path, "w") as f:
-            f.write(all_html)
-    print(f"[debug] HTML saved to {path}")
+    try:
+        html = frame.content()
+    except Exception:
+        html = "<error: could not get frame content>"
+    with open(path, "w") as f:
+        f.write(html)
+    print(f"[debug] Saved to {path}")
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main
 # ---------------------------------------------------------------------------
 
 def run_quiz(url: str, debug: bool = False) -> None:
@@ -305,58 +322,67 @@ def run_quiz(url: str, debug: bool = False) -> None:
         except Exception:
             raise SystemExit(
                 "\n[!] Could not connect to Chrome.\n"
-                "    Launch Chrome with:\n\n"
-                '    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome '
+                "    Launch Chrome with remote debugging first:\n\n"
+                "    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
                 "--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug &\n"
             )
 
-        print("[+] Connected to your Chrome session.")
+        print("[+] Connected to Chrome.")
         context = browser.contexts[0]
         page = find_quiz_page(context, url)
         frame = get_quiz_frame(page)
 
-        print("[+] Starting quiz...\n")
-
         if debug:
-            dump_page(page, frame)
-            print("[debug] Exiting after page dump. Check ~/Downloads/quiz_debug.html")
+            dump_page(frame)
+            print("[debug] Done. Check ~/Downloads/quiz_debug.html")
             return
 
+        print("\n[+] Starting quiz...\n")
         question_num = 0
+
         while True:
             question_num += 1
-            print(f"[Q{question_num}] Reading question...")
+            info = get_page_info(frame)
+            page_label = (
+                f"page {info['current']}/{info['total']}"
+                if info["current"] else f"question {question_num}"
+            )
+            print(f"[Q{question_num}] Reading question ({page_label})...")
+
             try:
                 question_text, choices = scrape_question(frame)
             except PWTimeoutError:
-                print("[!] No question found – quiz may be complete.")
+                print("[!] No question found – quiz may be finished.")
+                break
+
+            if not question_text and not choices:
+                print("  [!] Empty question – quiz may be complete.")
                 break
 
             if not choices:
                 print(f"  [!] No answer choices found – skipping.")
             else:
                 delay = random.randint(45, 90)
-                print(f"  Question : {question_text[:120]}...")
-                print(f"  Choices  : {choices}")
+                print(f"  Question : {question_text[:150]}")
+                for i, c in enumerate(choices):
+                    print(f"    {chr(65+i)}) {c}")
 
-                # Always screenshot — captures images if present, harmless if not
-                screenshot_b64 = screenshot_question(frame)
-                has_img = question_has_image(frame)
+                has_img = frame.evaluate(JS_HAS_IMAGE)
+                screenshot_b64 = screenshot_frame(frame)
                 if has_img:
-                    print(f"  [+] Image detected — sending screenshot to Claude.")
+                    print("  [+] Image detected in question – sending screenshot to Claude.")
 
-                print(f"  Waiting  : {delay}s before answering...")
+                print(f"  Waiting  : {delay}s...")
                 time.sleep(delay)
 
                 answer_letter = ask_claude(client, question_text, choices, screenshot_b64)
-                print(f"  Answer   : {answer_letter}")
+                print(f"  Answer   : {answer_letter}) {choices[ord(answer_letter)-65] if ord(answer_letter)-65 < len(choices) else '?'}")
                 select_answer(frame, answer_letter, choices)
-                time.sleep(1)
 
             if not advance(frame):
                 break
 
-        print("[+] Done.")
+        print("\n[+] Done.")
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +390,9 @@ def run_quiz(url: str, debug: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="D2L quiz bot – attaches to your open Chrome tab.")
-    parser.add_argument("--url", required=True, help="Full URL of the D2L quiz page.")
-    parser.add_argument("--debug", action="store_true", help="Save page HTML and exit (for fixing selectors).")
+    parser = argparse.ArgumentParser(description="D2L quiz bot – attaches to open Chrome tab.")
+    parser.add_argument("--url", required=True, help="Full D2L quiz URL.")
+    parser.add_argument("--debug", action="store_true", help="Dump page HTML and exit.")
     args = parser.parse_args()
     run_quiz(args.url, debug=args.debug)
 
