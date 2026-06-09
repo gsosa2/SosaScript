@@ -141,6 +141,29 @@ def find_quiz_page(context, url: str):
     return page
 
 
+def get_quiz_frame(page):
+    """
+    D2L loads quiz content inside an iframe. Try to find it and return
+    the frame; fall back to the main page if not found.
+    """
+    # Try by src pattern first
+    for frame in page.frames:
+        if "quiz_start_iframe" in frame.url or "quiz_attempt" in frame.url:
+            print(f"[+] Using quiz iframe: {frame.url}")
+            return frame
+
+    # Try by element selector
+    iframe_el = page.query_selector('iframe[src*="quizzing"], iframe[title="Main Content"]')
+    if iframe_el:
+        frame = iframe_el.content_frame()
+        if frame:
+            print(f"[+] Using quiz iframe via element: {frame.url}")
+            return frame
+
+    print("[*] No iframe found – using main page.")
+    return page
+
+
 def scrape_question(page) -> tuple[str, list[str]]:
     page.wait_for_selector(SEL_QUESTION_STEM, timeout=15_000)
 
@@ -223,10 +246,11 @@ def advance(page) -> bool:
 # Debug helper
 # ---------------------------------------------------------------------------
 
-def dump_page(page) -> None:
+def dump_page(page, frame=None) -> None:
     path = os.path.expanduser("~/Downloads/quiz_debug.html")
+    target = frame if frame and frame != page else page
     with open(path, "w") as f:
-        f.write(page.content())
+        f.write(target.content())
     print(f"[debug] Page HTML saved to {path}")
 
 
@@ -255,11 +279,12 @@ def run_quiz(url: str, debug: bool = False) -> None:
         print("[+] Connected to your Chrome session.")
         context = browser.contexts[0]
         page = find_quiz_page(context, url)
+        frame = get_quiz_frame(page)
 
         print("[+] Starting quiz...\n")
 
         if debug:
-            dump_page(page)
+            dump_page(page, frame)
             print("[debug] Exiting after page dump. Check ~/Downloads/quiz_debug.html")
             return
 
@@ -268,7 +293,7 @@ def run_quiz(url: str, debug: bool = False) -> None:
             question_num += 1
             print(f"[Q{question_num}] Reading question...")
             try:
-                question_text, choices = scrape_question(page)
+                question_text, choices = scrape_question(frame)
             except PWTimeoutError:
                 print("[!] No question found – quiz may be complete.")
                 break
@@ -281,8 +306,8 @@ def run_quiz(url: str, debug: bool = False) -> None:
                 print(f"  Choices  : {choices}")
 
                 # Always screenshot — captures images if present, harmless if not
-                screenshot_b64 = screenshot_question(page)
-                has_img = question_has_image(page)
+                screenshot_b64 = screenshot_question(frame)
+                has_img = question_has_image(frame)
                 if has_img:
                     print(f"  [+] Image detected — sending screenshot to Claude.")
 
@@ -291,10 +316,10 @@ def run_quiz(url: str, debug: bool = False) -> None:
 
                 answer_letter = ask_claude(client, question_text, choices, screenshot_b64)
                 print(f"  Answer   : {answer_letter}")
-                select_answer(page, answer_letter, choices)
+                select_answer(frame, answer_letter, choices)
                 time.sleep(1)
 
-            if not advance(page):
+            if not advance(frame):
                 break
 
         print("[+] Done.")
