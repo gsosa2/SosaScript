@@ -129,24 +129,28 @@ def find_quiz_page(context, url: str):
 
 def get_quiz_frame(page):
     """
-    D2L loads quiz content inside an iframe. Try to find it and return
-    the frame; fall back to the main page if not found.
+    D2L nests the quiz in one or more iframes. Walk all frames and pick
+    the deepest one that contains quiz question content.
     """
-    # Try by src pattern first
+    print(f"[+] All frames found:")
     for frame in page.frames:
-        if "quiz_start_iframe" in frame.url or "quiz_attempt" in frame.url:
-            print(f"[+] Using quiz iframe: {frame.url}")
-            return frame
+        print(f"    {frame.url}")
 
-    # Try by element selector
-    iframe_el = page.query_selector('iframe[src*="quizzing"], iframe[title="Main Content"]')
-    if iframe_el:
-        frame = iframe_el.content_frame()
-        if frame:
-            print(f"[+] Using quiz iframe via element: {frame.url}")
-            return frame
+    # Prefer the innermost frame with actual question content
+    for frame in reversed(page.frames):
+        if frame == page.main_frame:
+            continue
+        try:
+            has_content = frame.evaluate("""() => {
+                return document.querySelectorAll('d2l-html-block, tr.d2l-rowshadeonhover, .dfs_m').length > 0;
+            }""")
+            if has_content:
+                print(f"[+] Using quiz frame: {frame.url}")
+                return frame
+        except Exception:
+            continue
 
-    print("[*] No iframe found – using main page.")
+    print("[*] No quiz frame found – using main page.")
     return page
 
 
