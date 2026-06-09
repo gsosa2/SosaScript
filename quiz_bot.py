@@ -8,7 +8,7 @@ Answers each question using Claude AI with a random 45-90 second delay.
 Quit Chrome completely, then launch it with remote debugging enabled:
 
   Mac:
-    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222
 
   Then open D2L, log in, and navigate to your quiz tab as normal.
 
@@ -181,7 +181,7 @@ def run_quiz(url: str) -> None:
             raise SystemExit(
                 "\n[!] Could not connect to Chrome.\n"
                 "    Make sure Chrome is running with remote debugging:\n\n"
-                '    /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n'
+                "    open -a 'Google Chrome' --args --remote-debugging-port=9222\n"
             )
 
         print("[+] Connected to your Chrome session.")
