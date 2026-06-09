@@ -240,10 +240,33 @@ def advance(page) -> bool:
 
 def dump_page(page, frame=None) -> None:
     path = os.path.expanduser("~/Downloads/quiz_debug.html")
-    target = frame if frame and frame != page else page
-    with open(path, "w") as f:
-        f.write(target.content())
-    print(f"[debug] Page HTML saved to {path}")
+    # Try the iframe first; fall back to full page
+    saved = False
+    if frame and frame != page:
+        try:
+            html = frame.content()
+            with open(path, "w") as f:
+                f.write(html)
+            saved = True
+        except Exception:
+            pass
+    if not saved:
+        # Pull HTML from every frame via JS and concatenate
+        all_html = page.evaluate("""() => {
+            let out = '<!-- MAIN PAGE -->' + document.documentElement.outerHTML;
+            for (const iframe of document.querySelectorAll('iframe')) {
+                try {
+                    out += '\\n\\n<!-- IFRAME: ' + iframe.src + ' -->\\n';
+                    out += iframe.contentDocument.documentElement.outerHTML;
+                } catch(e) {
+                    out += '<!-- could not access iframe: ' + e + ' -->';
+                }
+            }
+            return out;
+        }""")
+        with open(path, "w") as f:
+            f.write(all_html)
+    print(f"[debug] HTML saved to {path}")
 
 
 # ---------------------------------------------------------------------------
