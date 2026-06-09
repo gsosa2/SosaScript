@@ -167,7 +167,15 @@ def advance(page) -> bool:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_quiz(url: str) -> None:
+def dump_page(page) -> None:
+    """Save page HTML to a file for selector debugging."""
+    path = os.path.expanduser("~/Downloads/quiz_debug.html")
+    with open(path, "w") as f:
+        f.write(page.content())
+    print(f"[debug] Page HTML saved to {path}")
+
+
+def run_quiz(url: str, debug: bool = False) -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise SystemExit("Set ANTHROPIC_API_KEY before running.")
@@ -189,6 +197,12 @@ def run_quiz(url: str) -> None:
         page = find_quiz_page(context, url)
 
         print("[+] Starting quiz...\n")
+
+        if debug:
+            dump_page(page)
+            print("[debug] Exiting after page dump. Check ~/Downloads/quiz_debug.html")
+            return
+
         question_num = 0
         while True:
             question_num += 1
@@ -226,8 +240,9 @@ def run_quiz(url: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="D2L quiz bot – attaches to your open Chrome tab.")
     parser.add_argument("--url", required=True, help="Full URL of the D2L quiz page.")
+    parser.add_argument("--debug", action="store_true", help="Save page HTML and exit (for fixing selectors).")
     args = parser.parse_args()
-    run_quiz(args.url)
+    run_quiz(args.url, debug=args.debug)
 
 
 if __name__ == "__main__":
