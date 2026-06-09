@@ -158,6 +158,15 @@ def ask_claude(
 # Browser helpers
 # ---------------------------------------------------------------------------
 
+def countdown(label: str, seconds: int) -> None:
+    """Print a live updating countdown timer in the terminal."""
+    for remaining in range(seconds, 0, -1):
+        mins, secs = divmod(remaining, 60)
+        print(f"  {label}: {mins:02d}:{secs:02d} remaining...  ", end="\r", flush=True)
+        time.sleep(1)
+    print(f"  {label}: done!                    ")
+
+
 def wait_for_page(frame) -> None:
     try:
         frame.wait_for_load_state("domcontentloaded", timeout=10_000)
@@ -370,14 +379,18 @@ def run_quiz(url: str, debug: bool = False) -> None:
                 has_img = frame.evaluate(JS_HAS_IMAGE)
                 screenshot_b64 = screenshot_frame(frame)
                 if has_img:
-                    print("  [+] Image detected in question – sending screenshot to Claude.")
+                    print("  [+] Image detected – screenshot sent to Claude.")
 
-                print(f"  Waiting  : {delay}s...")
-                time.sleep(delay)
+                # Live countdown before answering (simulates reading time)
+                countdown("Reading", delay)
 
                 answer_letter = ask_claude(client, question_text, choices, screenshot_b64)
                 print(f"  Answer   : {answer_letter}) {choices[ord(answer_letter)-65] if ord(answer_letter)-65 < len(choices) else '?'}")
                 select_answer(frame, answer_letter, choices)
+
+                # Short pause after selecting before clicking Next (simulates review)
+                post_delay = random.randint(3, 8)
+                countdown("Reviewing", post_delay)
 
             if not advance(frame):
                 break
