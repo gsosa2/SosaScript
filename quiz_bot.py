@@ -125,11 +125,16 @@ def ask_claude(
     question_text: str,
     choices: list[str],
     screenshot_b64: str | None = None,
+    subject: str = "",
 ) -> str:
     lettered = "\n".join(f"{chr(65 + i)}) {c}" for i, c in enumerate(choices))
+    subject_line = f"This is a {subject} question.\n\n" if subject else ""
     text_prompt = (
-        "Answer the following multiple-choice question. "
-        "Reply with ONLY the letter of the best answer (A, B, C, …).\n\n"
+        f"You are an expert {subject} professor. "
+        f"Answer the following multiple-choice question carefully and accurately. "
+        f"Think through each option before deciding. "
+        f"Reply with ONLY the letter of the best answer (A, B, C, …).\n\n"
+        f"{subject_line}"
         f"Question:\n{question_text}\n\n"
         f"Choices:\n{lettered}"
     )
@@ -318,7 +323,7 @@ def dump_page(frame) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_quiz(url: str, debug: bool = False) -> None:
+def run_quiz(url: str, debug: bool = False, subject: str = "Intro to Economics") -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise SystemExit("Set ANTHROPIC_API_KEY before running.")
@@ -346,6 +351,7 @@ def run_quiz(url: str, debug: bool = False) -> None:
             print("[debug] Done. Check ~/Downloads/quiz_debug.html")
             return
 
+        print(f"[+] Subject: {subject}")
         print("\n[+] Starting quiz...\n")
         question_num = 0
 
@@ -384,7 +390,7 @@ def run_quiz(url: str, debug: bool = False) -> None:
                 # Live countdown before answering (simulates reading time)
                 countdown("Reading", delay)
 
-                answer_letter = ask_claude(client, question_text, choices, screenshot_b64)
+                answer_letter = ask_claude(client, question_text, choices, screenshot_b64, subject)
                 print(f"  Answer   : {answer_letter}) {choices[ord(answer_letter)-65] if ord(answer_letter)-65 < len(choices) else '?'}")
                 select_answer(frame, answer_letter, choices)
 
@@ -406,8 +412,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="D2L quiz bot – attaches to open Chrome tab.")
     parser.add_argument("--url", required=True, help="Full D2L quiz URL.")
     parser.add_argument("--debug", action="store_true", help="Dump page HTML and exit.")
+    parser.add_argument("--subject", default="Intro to Economics", help="Subject context for Claude (default: Intro to Economics).")
     args = parser.parse_args()
-    run_quiz(args.url, debug=args.debug)
+    run_quiz(args.url, debug=args.debug, subject=args.subject)
 
 
 if __name__ == "__main__":
