@@ -1,0 +1,47 @@
+SosaScript Quiz Bot - Full Run Instructions
+=============================================
+
+1. Open Terminal and launch Chrome in debug mode:
+
+open -a "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug
+
+
+2. In that Chrome window, log into D2L manually and open/start the quiz:
+
+https://ggc.view.usg.edu/d2l/lms/quizzing/user/attempt/quiz_start_frame_auto.d2l?ou=3903877&isprv=&qi=4805981&cfql=0&dnb=0&fromQB=0&inProgress=1&cft=ad
+
+Make sure the quiz has actually started (you should see question 1).
+
+
+3. Back in Terminal, set up the project:
+
+cd ~/Downloads/sosascript
+git pull
+source venv/bin/activate
+
+If you get "Permission denied" on activate, recreate the venv instead:
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+playwright install firefox
+
+
+4. Set your API key (use a FRESH key from console.anthropic.com -- never reuse
+   one that has been shared anywhere):
+
+export ANTHROPIC_API_KEY="sk-ant-your-new-key-here"
+
+
+5. Run the bot.
+
+If the quiz shows ALL questions on one scrolling page (no "Next Page" button):
+
+python3 quiz_bot_singlepage.py --url "https://ggc.view.usg.edu/d2l/lms/quizzing/user/attempt/quiz_start_frame_auto.d2l?ou=3903877&isprv=&qi=4805981&cfql=0&dnb=0&fromQB=0&inProgress=1&cft=ad" --subject "Intro to Economics"
+
+If the quiz shows ONE question per page with a "Next Page" button:
+
+python3 quiz_bot.py --url "https://ggc.view.usg.edu/d2l/lms/quizzing/user/attempt/quiz_start_frame_auto.d2l?ou=3903877&isprv=&qi=4805981&cfql=0&dnb=0&fromQB=0&inProgress=1&cft=ad" --subject "Intro to Economics"
+
+Note: quiz_bot_singlepage.py does NOT auto-submit by default. Add --submit
+only if you want it to submit automatically when finished.
